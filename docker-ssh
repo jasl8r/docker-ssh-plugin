@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+
+set -e
+
+DOCKER_SSH_RUN_DIR="/tmp/docker-ssh"
+DOCKER_SSH_AUTH_SOCK="${DOCKER_SSH_RUN_DIR}/ssh-sock"
+DOCKER_SSH_MASTER_SOCK="${DOCKER_SSH_RUN_DIR}/master-sock"
+DOCKER_SSH_PRIVATE_KEY="${DOCKER_SSH_RUN_DIR}/id_ed25519"
+DOCKER_SSH_PUBLIC_KEY="${DOCKER_SSH_RUN_DIR}/id_ed25519.pub"
+
+docker_cli_plugin_metadata() {
+    local version="0.1.0"
+    local vendor="Nuance"
+    local url="https://www.nuance.com"
+    local description="Docker SSH helper"
+    cat <<-EOF
+    {"SchemaVersion":"0.1.0","Vendor":"${vendor}","Version":"${version}","ShortDescription":"${description}","URL":"${url}"}
+EOF
+}
+
+ssh_forward() {
+    # create SSH private key
+    if [ ! -f ${DOCKER_SSH_PRIVATE_KEY} ]
+    then
+        mkdir -p ${DOCKER_SSH_RUN_DIR}
+        ssh-keygen -t ed25519  -N '' -qf ${DOCKER_SSH_PRIVATE_KEY}
+    fi
+
+    if ! docker exec docker-ssh echo ping > /dev/null 2> /dev/null
+    then
+        # run SSH server in docker
+        docker run --rm -dit \
+            -e PUBLIC_KEY="$( cat ${DOCKER_SSH_PUBLIC_KEY} )" \
+            -e USER_NAME=docker-ssh \
+            -e SUDO_ACCESS=true \
+            -v /tmp:/tmp \
+            -p 2222 \
+            --name docker-ssh \
+            linuxserver/openssh-server
+
+        # Wait until SSH server is live
+        local ssh_port=$( docker port docker-ssh 2222 | cut -d ':' -f 2 )
+        while ! nc -z 127.0.0.1 ${ssh_port}; do   
+            sleep 0.1
+        done
+
+        # forward SSH authentication to container
+        ssh -A docker-ssh@127.0.0.1 \
+            -i ${DOCKER_SSH_PRIVATE_KEY} \
+            -p ${ssh_port} \
+            -o StrictHostKeyChecking=no \
+            -S ${DOCKER_SSH_MASTER_SOCK} \
+            -Mf "mkdir -p ${DOCKER_SSH_RUN_DIR} && sudo ln -sf \$SSH_AUTH_SOCK ${DOCKER_SSH_AUTH_SOCK} && tail -f /dev/null"
+    fi
+}
+
+case "$1" in
+    docker-cli-plugin-metadata)
+        docker_cli_plugin_metadata
+        ;;
+    ssh)
+        shift
+
+        case "$1" in
+        setup)
+            ssh_forward
+            echo "SSH Forwarding Enabled"
+            ;;
+        shutdown)
+            docker kill docker-ssh
+            ;;
+        enabled)
+            test -S ${SSH_SOCK}
+            ;;
+        run)
+            ssh_forward
+            shift
+            exec docker run --mount type=bind,source=${DOCKER_SSH_AUTH_SOCK},target=${DOCKER_SSH_AUTH_SOCK} -e SSH_AUTH_SOCK="$DOCKER_SSH_AUTH_SOCK" $@
+            ;;
+        *)
+            exec docker $@
+            ;;
+    esac
+    ;;
+esac
